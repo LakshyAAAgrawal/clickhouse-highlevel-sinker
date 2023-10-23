@@ -3,6 +3,7 @@ package com.xlvchao.clickhouse.component;
 import com.google.common.collect.Lists;
 import com.xlvchao.clickhouse.model.ClickHouseSettings;
 import com.xlvchao.clickhouse.model.ClickHouseSinkRequest;
+import com.xlvchao.clickhouse.model.ClickHouseSqlFactory;
 import com.xlvchao.clickhouse.util.DateTimeUtil;
 import com.xlvchao.clickhouse.util.FutureUtil;
 import com.xlvchao.clickhouse.util.TableUtil;
@@ -34,12 +35,14 @@ public class ClickHouseWriter implements AutoCloseable {
     private final List<DataSource> dataSources;
     private final List<CompletableFuture<Boolean>> futures;
     private final ClickHouseSettings clickHouseSettings;
+    private final SinkFailureHandler handler;
 
 
-    public ClickHouseWriter(int threadNum, Properties properties, List<CompletableFuture<Boolean>> futures, List<DataSource> dataSources) {
+    public ClickHouseWriter(int threadNum, Properties properties, List<CompletableFuture<Boolean>> futures, List<DataSource> dataSources, SinkFailureHandler handler) {
         this.clickHouseSettings = new ClickHouseSettings(properties);
         this.futures = futures;
         this.dataSources = dataSources;
+        this.handler = handler;
         this.commonQueue = new LinkedBlockingQueue<>(clickHouseSettings.getQueueMaxCapacity());
         buildWriters(threadNum);
     }
@@ -53,7 +56,7 @@ public class ClickHouseWriter implements AutoCloseable {
 
             writeTasks = Lists.newArrayListWithCapacity(threadNum);
             for (int i = 0; i < threadNum; i++) {
-                WriterTask task = new WriterTask(i, dataSources, commonQueue, clickHouseSettings, futures, queueCounter);
+                WriterTask task = new WriterTask(i, dataSources, handler, commonQueue, clickHouseSettings, futures, queueCounter);
                 writeTasks.add(task);
                 submitService.submit(task);
             }
@@ -121,6 +124,7 @@ public class ClickHouseWriter implements AutoCloseable {
         private final AtomicLong queueCounter;
         private final ClickHouseSettings sinkSettings;
         private final List<DataSource> dataSources;
+        private final SinkFailureHandler handler;
         private final List<CompletableFuture<Boolean>> futures;
         private final int id;
         private volatile boolean isWorking;
@@ -128,6 +132,7 @@ public class ClickHouseWriter implements AutoCloseable {
 
         WriterTask(int id,
                    List<DataSource> dataSources,
+                   SinkFailureHandler handler,
                    BlockingQueue<ClickHouseSinkRequest> commonQueue,
                    ClickHouseSettings settings,
                    List<CompletableFuture<Boolean>> futures,
@@ -136,6 +141,7 @@ public class ClickHouseWriter implements AutoCloseable {
             this.sinkSettings = settings;
             this.commonQueue = commonQueue;
             this.dataSources = dataSources;
+            this.handler = handler;
             this.futures = futures;
             this.queueCounter = queueCounter;
         }
@@ -163,24 +169,24 @@ public class ClickHouseWriter implements AutoCloseable {
 
         @SuppressWarnings("unchecked")
         private void flushToClickHouse(ClickHouseSinkRequest sinkRequest, CompletableFuture<Boolean> future) {
-            String sqlTemplate = TableUtil.genSqlTemplate(sinkRequest.getClazz());
+            String sqlTemplate = ClickHouseSqlFactory.get(sinkRequest.getClazz());
             DataSource dataSource = selectDataSourceByRoundRobin();
             try (Connection conn = dataSource.getConnection();
                  PreparedStatement prepareStatement = conn.prepareStatement(sqlTemplate)) {
                 conn.setAutoCommit(false);
 
-                List logs = sinkRequest.getDatas();
+                List logs = sinkRequest.getData();
                 prepareParameters(prepareStatement, sinkRequest.getClazz(), logs);
                 long s = System.currentTimeMillis();
                 prepareStatement.executeBatch();
                 conn.commit();
                 long e = System.currentTimeMillis();
 
-                logger.info("Successful flush data to ClickHouse, elapsed = {}ms, batch size = {}, current attempt num = {}", (e - s), sinkRequest.getDatas().size(), sinkRequest.getAttemptCounter());
+                logger.info("Successful flush data to ClickHouse, elapsed = {}ms, batch size = {}, current attempt num = {}", (e - s), sinkRequest.getData().size(), sinkRequest.getAttemptCounter());
                 future.complete(true);
 
             } catch (Exception e) {
-                logger.error("Error while flush data to ClickHouse!", e);
+                logger.warn("Failed while flush data to ClickHouse at first time, and it will retry {} times! Exception: {}", sinkSettings.getMaxRetries(), e);
                 handleUnsuccessfulResponse(sinkRequest, future);
             } finally {
                 queueCounter.decrementAndGet();
@@ -209,25 +215,28 @@ public class ClickHouseWriter implements AutoCloseable {
         void prepareParameters(PreparedStatement prepareStatement, Class clazz, List params) throws IllegalAccessException, SQLException {
             for (int i = 0; i < params.size(); i++) {
                 Object object = params.get(i);
-                Field[] fields = clazz.getDeclaredFields();
-                for (int j = 0; j < fields.length; j++) {
-                    Field field = fields[j];
-                    field.setAccessible(true);
+                if(object != null) {
+                    Field[] fields = clazz.getDeclaredFields();
+                    for (int j = 0; j < fields.length; j++) {
+                        Field field = fields[j];
+                        field.setAccessible(true);
 
-                    Class type = field.getType();
-                    Object value = field.get(object);
-                    if (value != null && type == Date.class) {
-                        value = DateTimeUtil.formatDate((Date) value);
-                    } else if (value != null && type == LocalDateTime.class) {
-                        value = DateTimeUtil.formatLocalDateTime((LocalDateTime) value);
+                        Class type = field.getType();
+                        Object value = field.get(object);
+                        if (value != null && type == Date.class) {
+                            value = DateTimeUtil.formatDate((Date) value);
+                        } else if (value != null && type == LocalDateTime.class) {
+                            value = DateTimeUtil.formatLocalDateTime((LocalDateTime) value);
+                        }
+
+                        prepareStatement.setObject(j+1, value);
                     }
-
-                    prepareStatement.setObject(j+1, value);
+                    prepareStatement.addBatch();
+                } else {
+                    logger.warn("warning: null object!");
                 }
-                prepareStatement.addBatch();
             }
         }
-
 
         private void handleUnsuccessfulResponse(ClickHouseSinkRequest sinkRequest, CompletableFuture<Boolean> future) {
             int currentCounter = sinkRequest.getAttemptCounter();
@@ -235,12 +244,12 @@ public class ClickHouseWriter implements AutoCloseable {
                 if (currentCounter >= sinkSettings.getMaxRetries()) {
                     String msg = "Failed to flush data to ClickHouse, cause: limit of attempts is exceeded!";
                     logger.warn(msg);
-                    logFailedRecords(sinkRequest);
+                    handler.handle(sinkRequest.getData(), sinkRequest.getClazz());
                     future.completeExceptionally(new RuntimeException(msg));
                 } else {
                     sinkRequest.incrementCounter();
                     logger.warn("Next attempt to flush data to ClickHouse, batch size = {}, current attempt num = {}, max attempt num = {}",
-                            sinkRequest.getDatas().size(),
+                            sinkRequest.getData().size(),
                             sinkRequest.getAttemptCounter(),
                             sinkSettings.getMaxRetries());
 
@@ -253,10 +262,6 @@ public class ClickHouseWriter implements AutoCloseable {
                 logger.warn(msg);
                 future.completeExceptionally(new RuntimeException(msg));
             }
-        }
-
-        private void logFailedRecords(ClickHouseSinkRequest sinkRequest) throws Exception {
-            // TODO
         }
 
         void setStopWorking() {
