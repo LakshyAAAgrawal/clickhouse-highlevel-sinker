@@ -52,12 +52,8 @@ public class ServerNode {
             return new Builder();
         }
 
-        public Builder withIp(String ip) {
+        public Builder withIpPort(String ip, Integer port) {
             this.ip = ip;
-            return this;
-        }
-
-        public Builder withPort(Integer port) {
             this.port = port;
             return this;
         }

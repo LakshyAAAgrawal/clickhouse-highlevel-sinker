@@ -73,8 +73,7 @@ public class ClickHouseDataSource implements DataSource {
 
         return ServerNode.Builder
                 .newServerNode()
-                .withIp(arr[0])
-                .withPort(Integer.parseInt(arr[1]))
+                .withIpPort(arr[0], Integer.parseInt(arr[1]))
                 .build();
     }
 
@@ -83,8 +82,7 @@ public class ClickHouseDataSource implements DataSource {
         while (rs.next()) {
             ServerNode sn = ServerNode.Builder
                             .newServerNode()
-                            .withIp(rs.getString("host_address"))
-                            .withPort(8123)
+                            .withIpPort(rs.getString("host_address"), 8123)
                             .build();
 
             list.add(sn);

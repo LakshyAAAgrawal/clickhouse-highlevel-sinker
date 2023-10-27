@@ -112,8 +112,7 @@ public class ClickHouseSinkManager implements AutoCloseable {
         while (rs.next()) {
             ServerNode sn = ServerNode.Builder
                     .newServerNode()
-                    .withIp(rs.getString("host_address"))
-                    .withPort(8123)
+                    .withIpPort(rs.getString("host_address"), 8123)
                     .build();
             list.add(sn);
         }
